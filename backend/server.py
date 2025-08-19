@@ -4,7 +4,7 @@ from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
 from dotenv import load_dotenv
 from pydantic import BaseModel, Field, EmailStr
-from typing import Optional, List, Dict, Any
+from typing import Optional, List, Dict, Any, Tuple
 from pathlib import Path
 from datetime import datetime, timezone
 import uuid
@@ -13,6 +13,8 @@ import logging
 import base64
 import json
 import requests
+import re
+from urllib.parse import urlparse
 
 # Load env
 ROOT_DIR = Path(__file__).parent
@@ -129,22 +131,100 @@ async def get_current_user(credentials: Optional[HTTPAuthorizationCredentials] =
 
 def strip_html_simple(html: str) -> str:
     # naive stripping: remove tags and decode entities
-    import re
     from html import unescape
     text = re.sub(r'&lt;|&gt;|&amp;', lambda m: unescape(m.group(0)), html)
+    text = re.sub(r'<script[\s\S]*?</script>', ' ', text, flags=re.I)
+    text = re.sub(r'<style[\s\S]*?</style>', ' ', text, flags=re.I)
     text = re.sub(r'<[^>]+>', ' ', text)
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
-def fetch_url_snippet(url: str, max_chars: int = 1200) -> str:
+# --- Lightweight article extraction ---
+
+def extract_article(url: str, max_chars: int = 12000) -> Tuple[str, List[str]]:
+    """Fetch URL and extract title + paragraphs list.
+    Avoids heavy dependencies. Uses bs4 if available, otherwise simple regex fallback.
+    Returns: (title, paragraphs)
+    """
+    headers = {'User-Agent': 'FakeFinderBot/1.0 (+https://example.com)'}
     try:
-        r = requests.get(url, timeout=15, headers={'User-Agent': 'FakeFinderBot/1.0'})
+        r = requests.get(url, headers=headers, timeout=20)
         r.raise_for_status()
-        text = strip_html_simple(r.text)
-        return text[:max_chars]
+        html = r.text
     except Exception as e:
         logger.warning(f'URL fetch failed: {e}')
-        return ''
+        return '', []
+
+    title = ''
+    paragraphs: List[str] = []
+
+    # Try BeautifulSoup if present
+    try:
+        from bs4 import BeautifulSoup  # type: ignore
+        soup = BeautifulSoup(html, 'html.parser')
+        # Title and headline
+        if soup.title and soup.title.string:
+            title = soup.title.string.strip()
+        h1 = soup.find('h1')
+        if h1 and h1.get_text(strip=True):
+            title = h1.get_text(strip=True)
+        # Remove nav/script/style
+        for tag in soup(['script', 'style', 'noscript', 'header', 'footer', 'aside']):
+            tag.decompose()
+        # Collect paragraphs
+        for p in soup.find_all('p'):
+            t = p.get_text(" ", strip=True)
+            if t and len(t) > 40:
+                paragraphs.append(t)
+        if not paragraphs:
+            # fallback to text body
+            body_text = soup.get_text(" ", strip=True)
+            paragraphs = [body_text[i:i+600] for i in range(0, min(len(body_text), max_chars), 600)]
+    except Exception:
+        # Regex fallback
+        m = re.search(r'<title>(.*?)</title>', html, flags=re.I|re.S)
+        if m:
+            title = strip_html_simple(m.group(1))
+        # get paragraphs
+        ps = re.findall(r'<p[^>]*>(.*?)</p>', html, flags=re.I|re.S)
+        for raw in ps:
+            t = strip_html_simple(raw)
+            if len(t) > 40:
+                paragraphs.append(t)
+        if not paragraphs:
+            text = strip_html_simple(html)
+            paragraphs = [text[i:i+600] for i in range(0, min(len(text), max_chars), 600)]
+
+    # Trim & limit
+    paragraphs = [p.strip()[:600] for p in paragraphs][:60]
+    title = (title or '').strip()[:280]
+    return title, paragraphs
+
+
+def score_paragraphs(query: str, paragraphs: List[str], top_k: int = 3) -> List[Tuple[str, float]]:
+    """Very simple relevance score: token overlap + position bias."""
+    if not paragraphs:
+        return []
+    q_tokens = set(re.findall(r'[a-zA-Z0-9]+', (query or '').lower()))
+    scored: List[Tuple[str, float]] = []
+    for idx, p in enumerate(paragraphs):
+        p_tokens = re.findall(r'[a-zA-Z0-9]+', p.lower())
+        if not p_tokens:
+            continue
+        overlap = sum(1 for t in p_tokens if t in q_tokens)
+        dens = overlap / max(6, len(p_tokens))
+        pos_bonus = 0.2 if idx < 5 else 0.0
+        score = dens + pos_bonus
+        scored.append((p, score))
+    scored.sort(key=lambda x: x[1], reverse=True)
+    return scored[:top_k]
+
+
+def fetch_url_snippet(url: str, max_chars: int = 1200) -> str:
+    title, paragraphs = extract_article(url, max_chars=max_chars)
+    joined = ' '.join(paragraphs)
+    return (title + ' ' + joined)[:max_chars]
+
 
 def validate_image_data_url(image_data_url: str) -> bool:
     try:
@@ -197,7 +277,6 @@ async def create_status_check(input: StatusCheckCreate):
 @api_router.get('/status', response_model=List[StatusCheck])
 async def get_status_checks():
     items = await db.status_checks.find().to_list(1000)
-    # Convert timestamp back to datetime if it's string
     out: List[StatusCheck] = []
     for it in items:
         ts = it.get('timestamp')
@@ -238,12 +317,23 @@ async def login(payload: UserLogin):
 async def me(current=Depends(get_current_user)):
     return MeResponse(id=current['id'], email=current['email'])
 
-# -------- LLM Analyze --------
+# -------- LLM Analyze with scraping-based evidence --------
 @api_router.post('/llm/analyze', response_model=AnalyzeResponse)
 async def analyze(req: AnalyzeRequest, current=Depends(get_current_user)):
     if not req.headline and not req.url and not req.image_base64:
         raise HTTPException(status_code=400, detail='Provide at least one of headline, url, image_base64')
 
+    # Build evidence from URL if present
+    evidence_snippets: List[str] = []
+    if req.url:
+        art_title, paragraphs = extract_article(req.url)
+        query = req.headline or art_title or ''
+        top = score_paragraphs(query, paragraphs, top_k=3)
+        domain = urlparse(req.url).netloc if req.url else ''
+        for i, (snip, sc) in enumerate(top, start=1):
+            evidence_snippets.append(f"[S{i}] ({domain}) {snip}")
+
+    # URL snippet for extra context (short)
     url_snippet = ''
     if req.url:
         url_snippet = fetch_url_snippet(req.url)
@@ -274,8 +364,9 @@ async def analyze(req: AnalyzeRequest, current=Depends(get_current_user)):
     system = (
         'You are FakeFinder, an AI that verifies news headlines, detects bias, and rewrites headlines from alternate perspectives. '
         'Use any provided URL text snippet and image (OCR the image content if present). '
+        'You MUST cite supporting snippets using [S1], [S2], [S3] where applicable, matching the given context snippets. '
         'Return STRICT JSON adhering to the provided schema. Keep p_fake in [0,1]. '
-        'Ensure rewrites are concise and faithful. Evidence should be up to 3 succinct, source-agnostic snippets.'
+        'Ensure rewrites are concise and faithful.'
     )
 
     user_content: List[Dict[str, Any]] = []
@@ -286,6 +377,8 @@ async def analyze(req: AnalyzeRequest, current=Depends(get_current_user)):
         prompt_parts.append(f'URL: {req.url}')
     if url_snippet:
         prompt_parts.append(f'URL_Snippet: {url_snippet[:800]}')
+    if evidence_snippets:
+        prompt_parts.append('Context snippets: ' + ' \n'.join(evidence_snippets))
 
     if prompt_parts:
         user_content.append({'type': 'text', 'text': '\n'.join(prompt_parts)})
@@ -313,12 +406,16 @@ async def analyze(req: AnalyzeRequest, current=Depends(get_current_user)):
             'evidence': [content[:280]]
         }
 
+    # If we built evidence, ensure response includes at least them
+    if evidence_snippets and not data.get('evidence'):
+        data['evidence'] = evidence_snippets
+
     return AnalyzeResponse(
         verdict=data.get('verdict', 'unclear'),
         p_fake=float(data.get('p_fake', 0.5)),
         bias_label=data.get('bias_label', 'unknown'),
         rewrites=RewriteOutput(**data.get('rewrites', {'left': '', 'right': '', 'neutral': ''})),
-        evidence=data.get('evidence', []),
+        evidence=data.get('evidence', evidence_snippets),
         model_used=api_resp.get('model'),
         raw=api_resp
     )
