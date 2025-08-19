@@ -205,6 +205,8 @@ function Analyzer({ token }) {
               <Button onClick={submit} disabled={loading || (!headline && !url && !imageDataUrl)}>
                 {loading ? 'Analyzing…' : 'Analyze'}
               </Button>
+                {loading ? 'Analyzing…' : 'Analyze'}
+              </Button>
             </div>
           </CardContent>
         </Card>
