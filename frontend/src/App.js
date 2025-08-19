@@ -279,7 +279,7 @@ function App() {
 
         <Header onOpenAuth={() => setAuthOpen(true)} />
         <main>
-          {!token &amp;&amp; (
+          {!token && (
             <div className="auth-banner">
               <p>Please login to use FakeFinder.</p>
               <Button onClick={() => setAuthOpen(true)}><LogIn className="mr-2" size={16} /> Login / Sign up</Button>
