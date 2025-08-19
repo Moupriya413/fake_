@@ -94,6 +94,7 @@ class AnalyzeResponse(BaseModel):
     bias_label: str
     rewrites: RewriteOutput
     evidence: List[str] = []
+    citations: Optional[List[Dict[str, Any]]] = None
     model_used: Optional[str] = None
     raw: Optional[Dict[str, Any]] = None
 
@@ -325,6 +326,7 @@ async def analyze(req: AnalyzeRequest, current=Depends(get_current_user)):
 
     # Build evidence from URL if present
     evidence_snippets: List[str] = []
+    citations: List[Dict[str, Any]] = []
     if req.url:
         art_title, paragraphs = extract_article(req.url)
         query = req.headline or art_title or ''
@@ -332,6 +334,7 @@ async def analyze(req: AnalyzeRequest, current=Depends(get_current_user)):
         domain = urlparse(req.url).netloc if req.url else ''
         for i, (snip, sc) in enumerate(top, start=1):
             evidence_snippets.append(f"[S{i}] ({domain}) {snip}")
+            citations.append({'id': f'S{i}', 'url': req.url, 'domain': domain, 'snippet': snip})
 
     # URL snippet for extra context (short)
     url_snippet = ''
@@ -416,6 +419,7 @@ async def analyze(req: AnalyzeRequest, current=Depends(get_current_user)):
         bias_label=data.get('bias_label', 'unknown'),
         rewrites=RewriteOutput(**data.get('rewrites', {'left': '', 'right': '', 'neutral': ''})),
         evidence=data.get('evidence', evidence_snippets),
+        citations=citations or None,
         model_used=api_resp.get('model'),
         raw=api_resp
     )

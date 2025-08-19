@@ -11,9 +11,9 @@ import { Tabs, TabsContent, TabsList, TabsTrigger } from './components/ui/tabs';
 import { Label } from './components/ui/label';
 import { Progress } from './components/ui/progress';
 import { Badge } from './components/ui/badge';
-import { Dialog, DialogContent, DialogHeader, DialogTitle, DialogTrigger } from './components/ui/dialog';
+import { Dialog, DialogContent, DialogHeader, DialogTitle } from './components/ui/dialog';
 import { useToast } from './hooks/use-toast';
-import { ShieldCheck, AlertTriangle, Globe, Image as ImageIcon, Upload, LogIn, UserPlus } from 'lucide-react';
+import { ShieldCheck, AlertTriangle, Upload, LogIn, UserPlus } from 'lucide-react';
 
 const BACKEND_URL = process.env.REACT_APP_BACKEND_URL; // Do not hardcode
 const API = `${BACKEND_URL}/api`;
@@ -251,11 +251,22 @@ function Analyzer({ token }) {
               <Card className="glass">
                 <CardHeader><CardTitle>Evidence</CardTitle></CardHeader>
                 <CardContent>
-                  <ul className="evidence">
-                    {(result.evidence || []).map((e, i) => (
-                      <li key={i}>• {e}</li>
-                    ))}
-                  </ul>
+                  {Array.isArray(result.citations) && result.citations.length > 0 ? (
+                    <ul className="evidence">
+                      {result.citations.map((c, i) => (
+                        <li key={i}>
+                          <a className="cite-link" href={c.url} target="_blank" rel="noreferrer">[{c.id}] {c.domain}</a>
+                          <div className="cite-snippet">{c.snippet}</div>
+                        </li>
+                      ))}
+                    </ul>
+                  ) : (
+                    <ul className="evidence">
+                      {(result.evidence || []).map((e, i) => (
+                        <li key={i}>• {e}</li>
+                      ))}
+                    </ul>
+                  )}
                 </CardContent>
               </Card>
             </div>
