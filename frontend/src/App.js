@@ -209,7 +209,7 @@ function Analyzer({ token }) {
           </CardContent>
         </Card>
 
-        {result &amp;&amp; (
+        {result && (
           <div className="results">
             <Card className="glass">
               <CardHeader>
