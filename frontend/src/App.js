@@ -202,7 +202,7 @@ function Analyzer({ token }) {
               </TabsContent>
             </Tabs>
             <div className="flex justify-end mt-6">
-              <Button onClick={submit} disabled={loading || (!headline &amp;&amp; !url &amp;&amp; !imageDataUrl)}>
+              <Button onClick={submit} disabled={loading || (!headline && !url && !imageDataUrl)}>
                 {loading ? 'Analyzing…' : 'Analyze'}
               </Button>
             </div>
