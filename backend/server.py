@@ -1,4 +1,4 @@
-from fastapi import FastAPI, APIRouter, HTTPException, Depends, UploadFile, File
+from fastapi import FastAPI, APIRouter, HTTPException, Depends
 from fastapi.security import HTTPBearer, HTTPAuthorizationCredentials
 from starlette.middleware.cors import CORSMiddleware
 from motor.motor_asyncio import AsyncIOMotorClient
@@ -37,6 +37,19 @@ security = HTTPBearer(auto_error=False)
 # External LLM config (Emergent LLM key works across providers; using OpenAI REST)
 EMERGENT_LLM_KEY = os.environ.get('EMERGENT_LLM_KEY')
 OPENAI_API_BASE = 'https://api.openai.com/v1'
+
+# Optional heavy deps (Playwright + Trafilatura) detection
+try:
+    from playwright.sync_api import sync_playwright  # type: ignore
+    PLAYWRIGHT_AVAILABLE = True
+except Exception:
+    PLAYWRIGHT_AVAILABLE = False
+
+try:
+    import trafilatura  # type: ignore
+    TRAFILATURA_AVAILABLE = True
+except Exception:
+    TRAFILATURA_AVAILABLE = False
 
 # App setup
 app = FastAPI(title='FakeFinder API')
@@ -131,7 +144,6 @@ async def get_current_user(credentials: Optional[HTTPAuthorizationCredentials] =
         raise HTTPException(status_code=401, detail='Invalid token')
 
 def strip_html_simple(html: str) -> str:
-    # naive stripping: remove tags and decode entities
     from html import unescape
     text = re.sub(r'&lt;|&gt;|&amp;', lambda m: unescape(m.group(0)), html)
     text = re.sub(r'<script[\s\S]*?</script>', ' ', text, flags=re.I)
@@ -140,54 +152,34 @@ def strip_html_simple(html: str) -> str:
     text = re.sub(r'\s+', ' ', text).strip()
     return text
 
-# --- Lightweight article extraction ---
+# -------------------------------- Article Extraction --------------------------------
 
-def extract_article(url: str, max_chars: int = 12000) -> Tuple[str, List[str]]:
-    """Fetch URL and extract title + paragraphs list.
-    Avoids heavy dependencies. Uses bs4 if available, otherwise simple regex fallback.
-    Returns: (title, paragraphs)
-    """
-    headers = {'User-Agent': 'FakeFinderBot/1.0 (+https://example.com)'}
-    try:
-        r = requests.get(url, headers=headers, timeout=20)
-        r.raise_for_status()
-        html = r.text
-    except Exception as e:
-        logger.warning(f'URL fetch failed: {e}')
-        return '', []
-
+def _extract_bs4(html: str, max_chars: int = 12000) -> Tuple[str, List[str]]:
     title = ''
     paragraphs: List[str] = []
-
-    # Try BeautifulSoup if present
     try:
         from bs4 import BeautifulSoup  # type: ignore
         soup = BeautifulSoup(html, 'html.parser')
-        # Title and headline
         if soup.title and soup.title.string:
             title = soup.title.string.strip()
         h1 = soup.find('h1')
         if h1 and h1.get_text(strip=True):
             title = h1.get_text(strip=True)
-        # Remove nav/script/style
         for tag in soup(['script', 'style', 'noscript', 'header', 'footer', 'aside']):
             tag.decompose()
-        # Collect paragraphs
         for p in soup.find_all('p'):
-            t = p.get_text(" ", strip=True)
+            t = p.get_text(' ', strip=True)
             if t and len(t) > 40:
                 paragraphs.append(t)
         if not paragraphs:
-            # fallback to text body
-            body_text = soup.get_text(" ", strip=True)
-            paragraphs = [body_text[i:i+600] for i in range(0, min(len(body_text), max_chars), 600)]
+            body = soup.get_text(' ', strip=True)
+            paragraphs = [body[i:i+600] for i in range(0, min(len(body), max_chars), 600)]
     except Exception:
-        # Regex fallback
-        m = re.search(r'<title>(.*?)</title>', html, flags=re.I|re.S)
+        # regex fallback
+        m = re.search(r'<title>(.*?)</title>', html, flags=re.I | re.S)
         if m:
             title = strip_html_simple(m.group(1))
-        # get paragraphs
-        ps = re.findall(r'<p[^>]*>(.*?)</p>', html, flags=re.I|re.S)
+        ps = re.findall(r'<p[^>]*>(.*?)</p>', html, flags=re.I | re.S)
         for raw in ps:
             t = strip_html_simple(raw)
             if len(t) > 40:
@@ -195,15 +187,79 @@ def extract_article(url: str, max_chars: int = 12000) -> Tuple[str, List[str]]:
         if not paragraphs:
             text = strip_html_simple(html)
             paragraphs = [text[i:i+600] for i in range(0, min(len(text), max_chars), 600)]
+    return (title or '').strip()[:280], [p.strip()[:600] for p in paragraphs][:60]
 
-    # Trim & limit
-    paragraphs = [p.strip()[:600] for p in paragraphs][:60]
-    title = (title or '').strip()[:280]
-    return title, paragraphs
+
+def extract_article_requests(url: str, max_chars: int = 12000) -> Tuple[str, List[str]]:
+    headers = {'User-Agent': 'FakeFinderBot/1.0 (+https://example.com)'}
+    try:
+        r = requests.get(url, headers=headers, timeout=20)
+        r.raise_for_status()
+        html = r.text
+        return _extract_bs4(html, max_chars)
+    except Exception as e:
+        logger.warning(f'URL fetch failed: {e}')
+        return '', []
+
+
+def fetch_rendered_html(url: str, timeout_ms: int = 15000) -> Optional[str]:
+    if not PLAYWRIGHT_AVAILABLE:
+        return None
+    try:
+        with sync_playwright() as p:
+            browser = p.chromium.launch(headless=True)
+            ctx = browser.new_context()
+            page = ctx.new_page()
+            page.goto(url, timeout=timeout_ms, wait_until='domcontentloaded')
+            try:
+                page.wait_for_load_state('networkidle', timeout=5000)
+            except Exception:
+                pass
+            content = page.content()
+            browser.close()
+            return content
+    except Exception as e:
+        logger.warning(f'Playwright render failed: {e}')
+        return None
+
+
+def extract_with_trafilatura(html: str, url: str) -> Tuple[str, List[str]]:
+    if not TRAFILATURA_AVAILABLE:
+        return '', []
+    try:
+        text = trafilatura.extract(html, url=url, include_comments=False, include_tables=False, include_formatting=False, favor_recall=True)
+        if not text:
+            return '', []
+        m = re.search(r'<title>(.*?)</title>', html, flags=re.I | re.S)
+        title = strip_html_simple(m.group(1)) if m else ''
+        paras = [p.strip() for p in re.split(r'\n{2,}|\u2029', text) if len(p.strip()) > 40]
+        return title[:280], [p[:600] for p in paras][:60]
+    except Exception as e:
+        logger.warning(f'Trafilatura extraction failed: {e}')
+        return '', []
+
+
+def extract_article_smart(url: str, max_chars: int = 12000) -> Tuple[str, List[str]]:
+    # 1) requests + bs4
+    t1, p1 = extract_article_requests(url, max_chars)
+    if len(p1) >= 3:
+        return t1, p1
+    # 2) Playwright rendered HTML
+    html = fetch_rendered_html(url)
+    if html:
+        # 2a) Trafilatura
+        t2, p2 = extract_with_trafilatura(html, url)
+        if p2:
+            return (t2 or t1), p2
+        # 2b) bs4 on rendered
+        t3, p3 = _extract_bs4(html, max_chars)
+        if p3:
+            return (t3 or t1), p3
+    # fallback
+    return t1, p1
 
 
 def score_paragraphs(query: str, paragraphs: List[str], top_k: int = 3) -> List[Tuple[str, float]]:
-    """Very simple relevance score: token overlap + position bias."""
     if not paragraphs:
         return []
     q_tokens = set(re.findall(r'[a-zA-Z0-9]+', (query or '').lower()))
@@ -222,9 +278,9 @@ def score_paragraphs(query: str, paragraphs: List[str], top_k: int = 3) -> List[
 
 
 def fetch_url_snippet(url: str, max_chars: int = 1200) -> str:
-    title, paragraphs = extract_article(url, max_chars=max_chars)
-    joined = ' '.join(paragraphs)
-    return (title + ' ' + joined)[:max_chars]
+    t, paras = extract_article_smart(url, max_chars=max_chars)
+    joined = ' '.join(paras)
+    return (t + ' ' + joined)[:max_chars]
 
 
 def validate_image_data_url(image_data_url: str) -> bool:
@@ -265,30 +321,6 @@ async def call_gpt4o(messages: List[Dict[str, Any]], use_json: bool = True, mode
 async def root():
     return {'message': 'Hello World'}
 
-@api_router.post('/status', response_model=StatusCheck)
-async def create_status_check(input: StatusCheckCreate):
-    status_obj = StatusCheck(client_name=input.client_name)
-    await db.status_checks.insert_one({
-        'id': status_obj.id,
-        'client_name': status_obj.client_name,
-        'timestamp': status_obj.timestamp.isoformat()
-    })
-    return status_obj
-
-@api_router.get('/status', response_model=List[StatusCheck])
-async def get_status_checks():
-    items = await db.status_checks.find().to_list(1000)
-    out: List[StatusCheck] = []
-    for it in items:
-        ts = it.get('timestamp')
-        if isinstance(ts, str):
-            try:
-                it['timestamp'] = datetime.fromisoformat(ts)
-            except Exception:
-                it['timestamp'] = datetime.now(timezone.utc)
-        out.append(StatusCheck(**it))
-    return out
-
 # -------- Auth --------
 @api_router.post('/auth/signup', response_model=TokenResponse)
 async def signup(payload: UserCreate):
@@ -328,7 +360,7 @@ async def analyze(req: AnalyzeRequest, current=Depends(get_current_user)):
     evidence_snippets: List[str] = []
     citations: List[Dict[str, Any]] = []
     if req.url:
-        art_title, paragraphs = extract_article(req.url)
+        art_title, paragraphs = extract_article_smart(req.url)
         query = req.headline or art_title or ''
         top = score_paragraphs(query, paragraphs, top_k=3)
         domain = urlparse(req.url).netloc if req.url else ''
@@ -409,7 +441,6 @@ async def analyze(req: AnalyzeRequest, current=Depends(get_current_user)):
             'evidence': [content[:280]]
         }
 
-    # If we built evidence, ensure response includes at least them
     if evidence_snippets and not data.get('evidence'):
         data['evidence'] = evidence_snippets
 
